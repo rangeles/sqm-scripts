@@ -12,8 +12,6 @@
 #
 ################################################################################
 
-. ${SQM_LIB_DIR}/defaults.sh
-
 egress() {
 
     CEIL=${UPLINK}
@@ -177,4 +175,6 @@ sqm_stop() {
     $TC qdisc del dev $IFACE ingress
     $TC qdisc del dev $IFACE root
     $TC qdisc del dev $DEV root
+
+    return 0
 }
