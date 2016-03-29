@@ -34,6 +34,7 @@
 #sm: *_CAKE_OPTS should contain the diffserv keyword for cake
 [ -z "$INGRESS_CAKE_OPTS" ] && INGRESS_CAKE_OPTS="diffserv4"
 [ -z "$EGRESS_CAKE_OPTS" ] && EGRESS_CAKE_OPTS="diffserv4"
+[ -z "$SHAPER_BURST" ] && SHAPER_BURST="0"
 
 # Logging verbosity
 VERBOSITY_SILENT=0
@@ -45,7 +46,7 @@ VERBOSITY_TRACE=10
 [ -z "$SQM_VERBOSITY" ] && SQM_VERBOSITY=$VERBOSITY_INFO
 
 [ -z "$SQM_DEBUG" ] && SQM_DEBUG=0
-if [ "$SQM_DEBUG" == 1 ]
+if [ "$SQM_DEBUG" -eq "1" ]
 then
     SQM_DEBUG_LOG=${SQM_STATE_DIR}/${IFACE}.debug.log
     OUTPUT_TARGET=${SQM_DEBUG_LOG}
