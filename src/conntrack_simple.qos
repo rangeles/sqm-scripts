@@ -68,7 +68,7 @@ egress() {
         u32 match ip protocol 1 0xff flowid 1:13
 
     $TC filter add dev $IFACE parent 1:0 protocol ipv6 prio 9 \
-        u32 match ip protocol 58 0xff flowid 1:13
+        u32 match ip6 protocol 58 0xff flowid 1:13
 }
 
 
@@ -131,7 +131,7 @@ ingress() {
         u32 match ip protocol 1 0xff flowid 1:13
 
     $TC filter add dev $DEV parent 1:0 protocol ipv6 prio 9 \
-        u32 match ip protocol 58 0xff flowid 1:13
+        u32 match ip6 protocol 58 0xff flowid 1:13
 
     $IP link set dev $DEV up
 
