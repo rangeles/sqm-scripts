@@ -27,7 +27,7 @@ sqm_logger() {
         *) LEVEL=$1; shift ;;
     esac
 
-    if [ "$SQM_VERBOSITY" -ge "$LEVEL" ] ; then
+    if [ "$SQM_VERBOSITY_MAX" -ge "$LEVEL" ] && [ "$SQM_VERBOSITY_MIN" -le "$LEVEL" ] ; then
         if [ "$SQM_SYSLOG" -eq "1" ]; then
             logger -t SQM -s "$*"
         else
@@ -36,7 +36,7 @@ sqm_logger() {
     fi
     # slightly dangerous as this will keep adding to the log file
     if [ -n "${SQM_DEBUG}" -a "${SQM_DEBUG}" -eq "1" ]; then
-        if [ "$SQM_VERBOSITY" -ge "$LEVEL" -o "$LEVEL" -eq "$VERBOSITY_TRACE" ]; then
+        if [ "$SQM_VERBOSITY_MAX" -ge "$LEVEL" -o "$LEVEL" -eq "$VERBOSITY_TRACE" ]; then
             echo "$@" >> ${SQM_DEBUG_LOG}
         fi
     fi
@@ -67,7 +67,7 @@ ipt() {
     }
     sqm_trace "iptables $*"
     iptables $* >> ${OUTPUT_TARGET} 2>&1
-    sqm_trace "ip6tables ${d}"
+    sqm_trace "ip6tables $*"
     ip6tables $* >> ${OUTPUT_TARGET} 2>&1
 }
 
@@ -88,7 +88,7 @@ ip_wrapper() {
 
 do_modules() {
     for m in $ALL_MODULES; do
-        [ -d /sys/modules/${m} ] && ${INSMOD} $m 2>>${OUTPUT_TARGET}
+        [ -d /sys/modules/${m} ] || ${INSMOD} $m 2>>${OUTPUT_TARGET}
     done
 }
 
@@ -109,12 +109,12 @@ write_state_file() {
 get_ifb_associated_with_if() {
     local CUR_IF=$1
     # Stray ' in the comment is a fix for broken editor syntax highlighting
-    local CUR_IFB=$( $TC -p filter show parent ffff: dev ${CUR_IF} | grep -o -E ifb'[^)\ ]+' )    # '
+    local CUR_IFB=$( $TC_BINARY -p filter show parent ffff: dev ${CUR_IF} | grep -o -E ifb'[^)\ ]+' )    # '
     sqm_debug "ifb associated with interface ${CUR_IF}: ${CUR_IFB}"
 
     # we could not detect an associated IFB for CUR_IF
     if [ -z "${CUR_IFB}" ]; then
-        local TMP=$( $TC -p filter show parent ffff: dev ${CUR_IF} )
+        local TMP=$( $TC_BINARY -p filter show parent ffff: dev ${CUR_IF} )
         if [ ! -z "${TMP}" ]; then
             # oops, there is output but we failed to properly parse it? Ask for a user report
             sqm_error "#---- CUT HERE ----#"
@@ -190,9 +190,9 @@ get_ifb_for_if() {
 verify_qdisc() {
     local qdisc=$1
     local supported="$2"
-    local not=
     local ifb=TMP_IFB_4_SQM
     local root_string="root" # this works for most qdiscs
+    local args=""
 
     if [ -n "$supported" ]; then
         local found=0
@@ -205,12 +205,17 @@ verify_qdisc() {
     case $qdisc in
         #ingress is special
         ingress) root_string="" ;;
+        #cannot instantiate tbf without args
+        tbf) args="limit 1 burst 1 rate 1kbps" ;;
     esac
 
-    $TC qdisc replace dev $ifb $root_string $qdisc
+    $TC qdisc replace dev $ifb $root_string $qdisc $args
     res=$?
-    [ "$res" = "0" ] || not="NOT "
-    sqm_debug "QDISC $qdisc is ${not}useable."
+    if [ "$res" = "0" ] ; then
+        sqm_debug "QDISC $qdisc is useable."
+    else
+        sqm_error "QDISC $qdisc is NOT useable."
+    fi
     delete_ifb $ifb
     return $res
 }
@@ -229,7 +234,13 @@ get_htb_adsll_string() {
 
 get_stab_string() {
     STABSTRING=""
-    if [ "${LLAM}" = "tc_stab" -a "$LINKLAYER" != "none" ]; then
+    local TMP_LLAM=${LLAM}
+    if [ "${LLAM}" = "default" -a "$QDISC" != "cake" ]; then
+	sqm_debug "LLA: default link layer adjustment method for !cake is tc_stab"
+	TMP_LLAM="tc_stab"
+    fi
+
+    if [ "${TMP_LLAM}" = "tc_stab" -a "$LINKLAYER" != "none" ]; then
         STABSTRING="stab mtu ${STAB_MTU} tsize ${STAB_TSIZE} mpu ${STAB_MPU} overhead ${OVERHEAD} linklayer ${LINKLAYER}"
         sqm_debug "STAB: ${STABSTRING}"
     fi
@@ -239,7 +250,13 @@ get_stab_string() {
 # cake knows how to handle ATM and per packet overhead, so expose and use this...
 get_cake_lla_string() {
     STABSTRING=""
-    if [ "${LLAM}" = "cake" -a "${LINKLAYER}" != "none" ]; then
+    local TMP_LLAM=${LLAM}
+    if [ "${LLAM}" = "default" -a "$QDISC" = "cake" ]; then
+	sqm_debug "LLA: default link layer adjustment method for cake is cake"
+	TMP_LLAM="cake"
+    fi
+
+    if [ "${TMP_LLAM}" = "cake" -a "${LINKLAYER}" != "none" ]; then
         if [ "${LINKLAYER}" = "atm" ]; then
             STABSTRING="atm"
         fi
@@ -360,6 +377,35 @@ htb_quantum_step() {
 }
 
 
+get_burst() {
+    MTU=$1
+    BANDWIDTH=$2
+    BURST=
+
+    # 10 MTU burst can itself create delay under CPU load.
+    # It will need to all wait for a hardware commit.
+    # Note the lean mixture at high bandwidths for upper limit.
+    BANDWIDTH_L=$(( ${MTU} *  2 * 8 ))
+    BANDWIDTH_H=$(( ${MTU} * 18 * 8 ))
+
+
+    if [ ${BANDWIDTH} -gt ${BANDWIDTH_H} ] ; then
+        BURST=$(( ${HTB_MTU} * 10 ))
+
+    elif [ ${BANDWIDTH} -gt ${BANDWIDTH_L} ] ; then
+            # Start with 1ms buffer 2x MTU, and lean out the mixture at higher rates
+            BURST=$(( ${BANDWIDTH} - ${BANDWIDTH_L} ))
+            BURST=$(( ${BURST} / 16 ))
+            BURST=$(( ${BURST} / ${MTU} ))
+            BURST=$(( ${BURST} * ${MTU} ))
+            BURST=$(( ${BURST} + ${MTU} * 2 ))
+    fi
+
+    sqm_debug "BURST: ${BURST}, BANDWIDTH: ${BANDWIDTH}"
+
+    echo $BURST
+}
+
 # Create optional burst parameters to leap over CPU interupts when the CPU is
 # severly loaded. We need to be conservative though.
 get_htb_burst() {
@@ -367,31 +413,9 @@ get_htb_burst() {
     BANDWIDTH=$2
 
     if [ -n "${HTB_MTU}" -a "${SHAPER_BURST}" -eq "1" ] ; then
-        # 10 MTU burst can itself create delay under CPU load.
-        # It will need to all wait for a hardware commit.
-        BANDWIDTH_L=$(( ${HTB_MTU} *  2 * 8 ))
-        BANDWIDTH_H=$(( ${HTB_MTU} * 10 * 8 ))
-
-
-        if [ ${BANDWIDTH} -gt ${BANDWIDTH_H} ] ; then
-            HTB_BURST=$(( ${HTB_MTU} * 10 ))
-
-            sqm_debug "CUR_HTB_BURST: ${HTB_BURST}, BANDWIDTH: ${BANDWIDTH}"
-
-            echo burst ${HTB_BURST} cburst ${HTB_BURST}
-
-        elif [ ${BANDWIDTH} -gt ${BANDWIDTH_L} ] ; then
-            # Start with 1ms buffer 2x MTU, and lean out the mixture at higher rates
-            HTB_BURST=$(( ${BANDWIDTH} - ${BANDWIDTH_L} ))
-            HTB_BURST=$(( ${HTB_BURST} / 16 ))
-            HTB_BURST=$(( ${HTB_BURST} / ${HTB_MTU} ))
-            HTB_BURST=$(( ${HTB_BURST} * ${HTB_MTU} ))
-            HTB_BURST=$(( ${HTB_BURST} + ${HTB_MTU} * 2 ))
-
-            sqm_debug "CUR_HTB_BURST: ${HTB_BURST}, BANDWIDTH: ${BANDWIDTH}"
-
-            echo burst ${HTB_BURST} cburst ${HTB_BURST}
-
+        BURST=$( get_burst $HTB_MTU $BANDWIDTH )
+        if [ -n "$BURST" ]; then
+            echo burst $BURST cburst $BURST
         else
             sqm_debug "Default Burst, HTB will use MTU plus shipping and handling"
         fi

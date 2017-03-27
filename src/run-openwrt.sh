@@ -16,25 +16,23 @@ RUN_IFACE="$2"
 
 [ -d "${SQM_QDISC_STATE_DIR}" ] || ${SQM_LIB_DIR}/update-available-qdiscs
 
-# Stopping all active interfaces
-if [ "$ACTION" = "stop" -a -z "$RUN_IFACE" ]; then
-    for f in ${SQM_STATE_DIR}/*.state; do
-        # Source the state file prior to stopping; we need the $IFACE and
-        # $SCRIPT variables saved in there.
-        [ -f "$f" ] && ( . $f; IFACE=$IFACE SCRIPT=$SCRIPT SQM_DEBUG=$SQM_DEBUG SQM_DEBUG_LOG=$SQM_DEBUG_LOG OUTPUT_TARGET=$OUTPUT_TARGET ${SQM_LIB_DIR}/stop-sqm )
-    done
-    exit 0
-fi
+stop_statefile() {
+    local f="$1"
+    # Source the state file prior to stopping; we need the variables saved in
+    # there.
+    [ -f "$f" ] && ( . "$f";
+                     IFACE=$IFACE SCRIPT=$SCRIPT SQM_DEBUG=$SQM_DEBUG \
+                          SQM_DEBUG_LOG=$SQM_DEBUG_LOG \
+                          OUTPUT_TARGET=$OUTPUT_TARGET ${SQM_LIB_DIR}/stop-sqm )
+}
 
-config_load sqm
-
-run_sqm_scripts() {
+start_sqm_section() {
     local section="$1"
     export IFACE=$(config_get "$section" interface)
 
     [ -z "$RUN_IFACE" -o "$RUN_IFACE" = "$IFACE" ] || return
-
-    [ $(config_get "$section" enabled) -ne 1 ] && ACTION=stop
+    [ "$(config_get "$section" enabled)" -eq 1 ] || return
+    [ -f "${SQM_STATE_DIR}/${IFACE}.state" ] && return
 
     export UPLINK=$(config_get "$section" upload)
     export DOWNLINK=$(config_get "$section" download)
@@ -53,26 +51,37 @@ run_sqm_scripts() {
     export IQDISC_OPTS=$(config_get "$section" iqdisc_opts)
     export EQDISC_OPTS=$(config_get "$section" eqdisc_opts)
     export TARGET=$(config_get "$section" target)
-    export SQUASH_DSCP=$(config_get "$section" squash_dscp)
-    export SQUASH_INGRESS=$(config_get "$section" squash_ingress)
     export SHAPER_BURST=$(config_get "$section" shaper_burst)
     export HTB_QUANTUM_FUNCTION=$(config_get "$section" htb_quantum_function)
     export QDISC=$(config_get "$section" qdisc)
     export SCRIPT=$(config_get "$section" script)
 
+    # The UCI names for these two variables are confusing and should have been
+    # changed ages ago. For now, keep the bad UCI names but use meaningful
+    # variable names in the scripts to not break user configs.
+    export ZERO_DSCP_INGRESS=$(config_get "$section" squash_dscp)
+    export IGNORE_DSCP_INGRESS=$(config_get "$section" squash_ingress)
 
-    #sm: if SQM_DEBUG or SQM_VERBOSITY were passed in via the command line make them available to the other scripts
-    #	this allows to override sqm's log level as set in the GUI for quick debugging without GUI accesss.
-    [ -n "$SQM_DEBUG" ] && export SQM_DEBUG || export SQM_DEBUG=$(config_get "$section" debug_logging)
-    [ -n "$SQM_VERBOSITY" ] && export SQM_VERBOSITY || export SQM_VERBOSITY=$(config_get "$section" verbosity)
+    # If SQM_DEBUG or SQM_VERBOSITY_* were passed in via the command line make
+    # them available to the other scripts this allows to override sqm's log
+    # level as set in the GUI for quick debugging without GUI accesss.
+    export SQM_DEBUG=${SQM_DEBUG:-$(config_get "$section" debug_logging)}
+    export SQM_VERBOSITY_MAX=${SQM_VERBOSITY_MAX:-$(config_get "$section" verbosity)}
+    export SQM_VERBOSITY_MIN
 
-    #sm: only stop-sqm if there is something running
-    CUR_STATE_FILE="${SQM_STATE_DIR}/${IFACE}.state"
-    if [ -f "${CUR_STATE_FILE}" ]; then
-	"${SQM_LIB_DIR}/stop-sqm"
-    fi
-
-    [ "$ACTION" = "start" ] && "${SQM_LIB_DIR}/start-sqm"
+    "${SQM_LIB_DIR}/start-sqm"
 }
 
-config_foreach run_sqm_scripts
+if [ "$ACTION" = "stop" ]; then
+    if [ -z "$RUN_IFACE" ]; then
+        # Stopping all active interfaces
+        for f in ${SQM_STATE_DIR}/*.state; do
+            stop_statefile "$f"
+        done
+    else
+        stop_statefile "${SQM_STATE_DIR}/${RUN_IFACE}.state"
+    fi
+else
+    config_load sqm
+    config_foreach start_sqm_section
+fi

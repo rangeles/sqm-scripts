@@ -57,11 +57,21 @@ function e.write(self, section, value)
 end
 -- TODO: inform the user what we just did...
 
+
+-- Add to physical interface list a hint of the correpsonding network names,
+-- used to help users better select e.g. lan or wan interface.
+
 n = s:taboption("tab_basic", ListValue, "interface", translate("Interface name"))
 -- sm lifted from luci-app-wol, the original implementation failed to show pppoe-ge00 type interface names
 for _, iface in ipairs(ifaces) do
 	if not (iface == "lo" or iface:match("^ifb.*")) then
-		n:value(iface)
+		local nets = net:get_interface(iface)
+		nets = nets and nets:get_networks() or {}
+		for k, v in pairs(nets) do
+			nets[k] = nets[k].sid
+		end
+		nets = table.concat(nets, ",")
+		n:value(iface, ((#nets > 0) and "%s (%s)" % {iface, nets} or iface))
 	end
 end
 n.rmempty = false
@@ -111,12 +121,15 @@ c.rmempty = false
 local qos_desc = ""
 sc = s:taboption("tab_qdisc", ListValue, "script", translate("Queue setup script"))
 for file in fs.dir(path) do
-	if string.find(file, ".qos$") then
+	if string.find(file, ".qos$") and not fs.stat(path .. "/" .. file .. ".hidden") then
 		sc:value(file)
-	end
-	if string.find(file, ".qos.help$") then
-		fh = io.open(path .. "/" .. file, "r")
-		qos_desc = qos_desc .. "<p><b>" .. file:gsub(".help$", "") .. ":</b><br />" .. fh:read("*a") .. "</p>"
+		qos_desc = qos_desc .. "<p><b>" .. file .. ":</b><br />"
+		fh = io.open(path .. "/" .. file .. ".help", "r")
+		if fh then
+			qos_desc = qos_desc .. fh:read("*a") .. "</p>"
+		else
+			qos_desc = qos_desc .. "No help text</p>"
+		end
 	end
 end
 sc.default = "simple.qos"
@@ -237,10 +250,11 @@ smpu.rmempty = true
 smpu:depends("linklayer_advanced", "1")
 
 lla = s:taboption("tab_linklayer", ListValue, "linklayer_adaptation_mechanism", translate("Which linklayer adaptation mechanism to use; for testing only"))
+lla:value("default", "default ("..translate("default")..")")
 lla:value("cake")
 lla:value("htb_private")
-lla:value("tc_stab", "tc_stab ("..translate("default")..")")
-lla.default = "tc_stab"
+lla:value("tc_stab")
+lla.default = "default"
 lla.rmempty = true
 lla:depends("linklayer_advanced", "1")
 
