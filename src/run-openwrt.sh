@@ -10,24 +10,30 @@
 . /lib/functions.sh
 
 . /etc/sqm/sqm.conf
+. ${SQM_LIB_DIR}/functions.sh
 
 ACTION="${1:-start}"
 RUN_IFACE="$2"
 
+check_state_dir
 [ -d "${SQM_QDISC_STATE_DIR}" ] || ${SQM_LIB_DIR}/update-available-qdiscs
 
 stop_statefile() {
-    local f="$1"
+    local f
+    f="$1"
     # Source the state file prior to stopping; we need the variables saved in
     # there.
     [ -f "$f" ] && ( . "$f";
                      IFACE=$IFACE SCRIPT=$SCRIPT SQM_DEBUG=$SQM_DEBUG \
                           SQM_DEBUG_LOG=$SQM_DEBUG_LOG \
+                          SQM_VERBOSITY_MAX=$SQM_VERBOSITY_MAX \
+                          SQM_VERBOSITY_MIN=$SQM_VERBOSITY_MIN \
                           OUTPUT_TARGET=$OUTPUT_TARGET ${SQM_LIB_DIR}/stop-sqm )
 }
 
 start_sqm_section() {
-    local section="$1"
+    local section
+    section="$1"
     export IFACE=$(config_get "$section" interface)
 
     [ -z "$RUN_IFACE" -o "$RUN_IFACE" = "$IFACE" ] || return
@@ -51,8 +57,6 @@ start_sqm_section() {
     export IQDISC_OPTS=$(config_get "$section" iqdisc_opts)
     export EQDISC_OPTS=$(config_get "$section" eqdisc_opts)
     export TARGET=$(config_get "$section" target)
-    export SHAPER_BURST=$(config_get "$section" shaper_burst)
-    export HTB_QUANTUM_FUNCTION=$(config_get "$section" htb_quantum_function)
     export QDISC=$(config_get "$section" qdisc)
     export SCRIPT=$(config_get "$section" script)
 

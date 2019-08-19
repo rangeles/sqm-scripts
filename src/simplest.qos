@@ -34,10 +34,10 @@ cake_egress()
 
 egress() {
 
-    LQ="quantum `get_htb_quantum $IFACE ${UPLINK}`"
-    BURST="`get_htb_burst $IFACE ${UPLINK}`"
+    LQ="quantum `get_htb_quantum $IFACE ${UPLINK} ${ESHAPER_QUANTUM_DUR_US}`"
+    BURST="`get_htb_burst $IFACE ${UPLINK} ${ESHAPER_BURST_DUR_US}`"
 
-    $TC qdisc del dev $IFACE root 2>/dev/null
+    SILENT=1 $TC qdisc del dev $IFACE root
 
     case $QDISC in
         cake*) cake_egress; return ;;
@@ -64,13 +64,13 @@ cake_ingress()
 
 ingress() {
     sqm_debug "ingress"
-    $TC qdisc del dev $IFACE handle ffff: ingress 2>/dev/null
+    SILENT=1 $TC qdisc del dev $IFACE handle ffff: ingress
     $TC qdisc add dev $IFACE handle ffff: ingress
 
-    LQ="quantum `get_htb_quantum $IFACE ${DOWNLINK}`"
-    BURST="`get_htb_burst $IFACE ${DOWNLINK}`"
+    LQ="quantum `get_htb_quantum $IFACE ${DOWNLINK} ${ISHAPER_QUANTUM_DUR_US}`"
+    BURST="`get_htb_burst $IFACE ${DOWNLINK} ${ISHAPER_BURST_DUR_US}`"
 
-    $TC qdisc del dev $DEV root 2>/dev/null
+    SILENT=1 $TC qdisc del dev $DEV root
 
     case $QDISC in
         cake*) cake_ingress; return ;;
@@ -97,34 +97,9 @@ ingress() {
 
 }
 
-sqm_start() {
-    [ -n "$IFACE" ] || return 1
+sqm_prepare_script() {
     do_modules
     verify_qdisc "htb" || return 1
-    verify_qdisc $QDISC || return 1
-    sqm_debug "Starting ${SCRIPT}"
-
-    [ -z "$DEV" ] && DEV=$( get_ifb_for_if ${IFACE} )
-
-
-    if [ "$UPLINK" -ne 0 ]; then
-        egress
-        sqm_debug "egress shaping activated"
-    else
-        sqm_debug "egress shaping deactivated"
-        $TC qdisc del dev $IFACE root 2> /dev/null
-    fi
-    if [ "$DOWNLINK" -ne 0 ]; then
-        verify_qdisc ingress "ingress" || return 1
-        ingress
-        sqm_debug "ingress shaping activated"
-    else
-        sqm_debug "ingress shaping deactivated"
-        $TC qdisc del dev $DEV root 2> /dev/null
-        $TC qdisc del dev $IFACE ingress 2> /dev/null
-    fi
-
-    return 0
 }
 
 ################################################################################

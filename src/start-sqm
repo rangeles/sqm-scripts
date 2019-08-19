@@ -14,13 +14,13 @@
 . ${SQM_LIB_DIR}/defaults.sh
 STATE_FILE="${SQM_STATE_DIR}/${IFACE}.state"
 
+check_state_dir
+
 if [ -z "${SCRIPT}" ] ; then
     sqm_error "SCRIPT value is not defined in /etc/sqm/${IFACE}.iface.conf"
     sqm_error "Please check your configuration and try again."
     exit 1
 fi
-
-[ -d "${SQM_STATE_DIR}" ] || mkdir -p "${SQM_STATE_DIR}"
 
 if [ -f "${STATE_FILE}" ]; then
     sqm_error "SQM already activated on ${IFACE}."
@@ -47,6 +47,13 @@ fi
 
 sqm_trace; sqm_trace "$(date): Starting." # Add some space and a date stamp to verbose log output and log files to separate runs
 sqm_log "Starting SQM script: ${SCRIPT} on ${IFACE}, in: ${DOWNLINK} Kbps, out: ${UPLINK} Kbps"
-sqm_start && write_defaults_vars_to_state_file ${STATE_FILE} ${SQM_LIB_DIR}/defaults.sh && sqm_log "${SCRIPT} was started on ${IFACE} successfully"
+
+if fn_exists sqm_start ; then
+    sqm_log "Using script specific sqm_start function overriding the generic sqm_start_default."
+    sqm_start && write_defaults_vars_to_state_file ${STATE_FILE} ${SQM_LIB_DIR}/defaults.sh && sqm_log "${SCRIPT} was started on ${IFACE} successfully"
+else
+    sqm_log "Using generic sqm_start_default function."
+    sqm_start_default && write_defaults_vars_to_state_file ${STATE_FILE} ${SQM_LIB_DIR}/defaults.sh && sqm_log "${SCRIPT} was started on ${IFACE} successfully"
+fi
 
 exit 0

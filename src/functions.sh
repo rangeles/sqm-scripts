@@ -15,19 +15,35 @@
 # it under the terms of the GNU General Public License version 2 as
 # published by the Free Software Foundation.
 #
-#   Copyright (C) 2012-6
+#   Copyright (C) 2012-2019
 #       Michael D. Taht, Toke Høiland-Jørgensen, Sebastian Moeller
 #       Eric Luehrsen
 #
 ################################################################################
 
+# Logging verbosity
+VERBOSITY_SILENT=0
+VERBOSITY_ERROR=1
+VERBOSITY_WARNING=2
+VERBOSITY_INFO=5
+VERBOSITY_DEBUG=8
+VERBOSITY_TRACE=10
+
 sqm_logger() {
+    local level_min
+    local level_max
+    local debug
+
     case $1 in
         ''|*[!0-9]*) LEVEL=$VERBOSITY_INFO ;; # empty or non-numbers
         *) LEVEL=$1; shift ;;
     esac
 
-    if [ "$SQM_VERBOSITY_MAX" -ge "$LEVEL" ] && [ "$SQM_VERBOSITY_MIN" -le "$LEVEL" ] ; then
+    level_min=${SQM_VERBOSITY_MIN:-$VERBOSITY_SILENT}
+    level_max=${SQM_VERBOSITY_MAX:-$VERBOSITY_INFO}
+    debug=${SQM_DEBUG:-0}
+
+    if [ "$level_max" -ge "$LEVEL" ] && [ "$level_min" -le "$LEVEL" ] ; then
         if [ "$SQM_SYSLOG" -eq "1" ]; then
             logger -t SQM -s "$*"
         else
@@ -35,8 +51,8 @@ sqm_logger() {
         fi
     fi
     # slightly dangerous as this will keep adding to the log file
-    if [ -n "${SQM_DEBUG}" -a "${SQM_DEBUG}" -eq "1" ]; then
-        if [ "$SQM_VERBOSITY_MAX" -ge "$LEVEL" -o "$LEVEL" -eq "$VERBOSITY_TRACE" ]; then
+    if [ "$debug" -eq "1" ]; then
+        if [ "$level_max" -ge "$LEVEL" -o "$LEVEL" -eq "$VERBOSITY_TRACE" ]; then
             echo "$@" >> ${SQM_DEBUG_LOG}
         fi
     fi
@@ -48,90 +64,219 @@ sqm_log() { sqm_logger $VERBOSITY_INFO "$@"; }
 sqm_debug() { sqm_logger $VERBOSITY_DEBUG "$@"; }
 sqm_trace() { sqm_logger $VERBOSITY_TRACE "$@"; }
 
-# ipt needs a toggle to show the outputs for debugging (as do all users of >
-# /dev/null 2>&1 and friends)
+
+# Inspired from https://stackoverflow.com/questions/85880/determine-if-a-function-exists-in-bash
+#fn_exists() { LC_ALL=C type $1 | grep -q 'is a function'; }
+fn_exists() {
+    local FN_CANDIDATE
+    local CUR_LC_ALL
+    local TYPE_OUTPUT
+    local RET
+    FN_CANDIDATE=$1
+    # check that a candidate nme was given
+    if [ -z "${FN_CANDIDATE}" ]; then
+	sqm_error "fn_exists: no function name specified as first argument."
+	return 1
+    fi
+    sqm_debug "fn_exists: function candidate name: ${FN_CANDIDATE}"
+
+    # extract the textual type description
+    TYPE_OUTPUT=$( LC_ALL=C type $1 )
+    sqm_debug "fn_exists: TYPE_OUTPUT: $TYPE_OUTPUT"
+
+    # OpenWrt (2019) returns 'is a function'
+    # Debian Buster/raspbian returns 'is a shell function'
+    # let's just hope no Linux system reurn 'is a shell builtin function'
+    echo ${TYPE_OUTPUT} | grep -q 'function'
+    RET=$?
+
+    sqm_debug "fn_exists: return value: ${RET}"
+    return ${RET}
+}
+
+
+# Transaction logging for ipt rules to allow for gracefull final teardown
+ipt_log_restart() {
+    [ -f "$IPT_TRANS_LOG" ] && rm -f "$IPT_TRANS_LOG"
+}
+
+
+ipt_log() {
+    echo "$@" >> "$IPT_TRANS_LOG"
+}
+
+
+# Read the transaction log in reverse and execute using ipt to undo changes.
+# Since we logged only ipt '-D' commands, ipt won't add them again to the
+# transaction log, but will include them in the syslog/debug log.
+ipt_log_rewind() {
+    [ -f "$IPT_TRANS_LOG" ] || return 0
+    sed -n '1!G;h;$p' "$IPT_TRANS_LOG" |
+    while IFS= read d; do
+        ipt $d
+    done
+}
+
+
+# to avoid unexpected side-effects first delete rules before adding them (again)
 ipt() {
-    d=$(echo $* | sed s/-A/-D/g)
-    [ "$d" != "$*" ] && {
-        sqm_trace "iptables ${d}"
-        iptables $d >> ${OUTPUT_TARGET} 2>&1
-        sqm_trace "ip6tables ${d}"
-        ip6tables $d >> ${OUTPUT_TARGET} 2>&1
-    }
-    d=$(echo $* | sed s/-I/-D/g)
-    [ "$d" != "$*" ] && {
-        sqm_trace "iptables ${d}"
-        iptables $d >> ${OUTPUT_TARGET} 2>&1
-        sqm_trace "ip6tables ${d}"
-        ip6tables $d >> ${OUTPUT_TARGET} 2>&1
-    }
-    sqm_trace "iptables $*"
-    iptables $* >> ${OUTPUT_TARGET} 2>&1
-    sqm_trace "ip6tables $*"
-    ip6tables $* >> ${OUTPUT_TARGET} 2>&1
+    local d
+    # Try to wipe pre-existing rules and chains, and prepare the transation
+    # log to do the same at shutdown.
+    for rep in "s/-A/-D/g" "s/-I/-D/g" "s/-N/-X/g"; do
+        d=$(echo $* | sed $rep)
+        [ "$d" != "$*" ] && {
+            SILENT=1 ${IPTABLES} $d
+            SILENT=1 ${IP6TABLES} $d
+            ipt_log $d
+        }
+    done
+
+    SILENT=1 ${IPTABLES} "$@"
+    SILENT=1 ${IP6TABLES} "$@"
+}
+
+
+# wrapper to call iptables to allow debug logging
+iptables_wrapper(){
+    cmd_wrapper iptables ${IPTABLES_BINARY} "$@"
+}
+
+# wrapper to call ip6tables to allow debug logging
+ip6tables_wrapper(){
+    cmd_wrapper ip6tables ${IP6TABLES_BINARY} "$@"
 }
 
 # wrapper to call tc to allow debug logging
-tc_wrapper() {
-    tc_args=$*
-    sqm_trace "${TC_BINARY} $*"
-    ${TC_BINARY} $* >> ${OUTPUT_TARGET} 2>&1
+tc_wrapper(){
+    cmd_wrapper tc ${TC_BINARY} "$@"
 }
 
-# wrapper to call tc to allow debug logging
-ip_wrapper() {
-    ip_args=$*
-    sqm_trace "${IP_BINARY} $*"
-    ${IP_BINARY} $* >> ${OUTPUT_TARGET} 2>&1
+# wrapper to call ip to allow debug logging
+ip_wrapper(){
+    cmd_wrapper ip ${IP_BINARY} "$@"
+}
+
+# the actual command execution wrapper
+cmd_wrapper(){
+    # $1: the symbolic name of the command for informative output
+    # $2: the name of the binary to call (potentially including the full path)
+    # $3-$end: the actual arguments for $2
+    local CALLERID
+    local CMD_BINARY
+    local LAST_ERROR
+    local RET
+    local ERRLOG
+
+    CALLERID=$1 ; shift 1   # extract and remove the id string
+    CMD_BINARY=$1 ; shift 1 # extract and remove the binary
+
+    # Handle silencing of errors from callers
+    ERRLOG="sqm_error"
+    if [ "$SILENT" -eq "1" ]; then
+        ERRLOG="sqm_debug"
+        sqm_debug "cmd_wrapper: ${CALLERID}: invocation silenced by request, failure either expected or acceptable."
+        # The busybox shell doesn't understand the concept of an inline variable
+        # only applying to a single command, so we need to reset SILENT
+        # afterwards. Ugly, but it works...
+        SILENT=0
+    fi
+
+    sqm_trace "${CMD_BINARY} $@"
+    LAST_ERROR=$( ${CMD_BINARY} "$@" 2>&1 )
+    RET=$?
+    sqm_trace "${LAST_ERROR}"
+
+    if [ "$RET" -eq "0" ] ; then
+        sqm_debug "cmd_wrapper: ${CALLERID}: SUCCESS: ${CMD_BINARY} $@"
+    else
+        # this went south, try to capture & report more detail
+        $ERRLOG "cmd_wrapper: ${CALLERID}: FAILURE (${RET}): ${CMD_BINARY} $@"
+        $ERRLOG "cmd_wrapper: ${CALLERID}: LAST ERROR: ${LAST_ERROR}"
+    fi
+
+    return $RET
 }
 
 
 do_modules() {
     for m in $ALL_MODULES; do
-        [ -d /sys/modules/${m} ] || ${INSMOD} $m 2>>${OUTPUT_TARGET}
+        [ -d /sys/module/${m} ] || ${INSMOD} $m 2>>${OUTPUT_TARGET}
     done
 }
 
 # Write a state file to the filename given as $1. This version will extract all
 # variable names defined in defaults.sh and since defaults.sh should contain all
 # used variables this should be the complete set.
-write_defaults_vars_to_state_file() { ${STATE_FILE} ${SQM_LIB_DIR}/defaults.sh
-    local filename=$1
-    local defaultsFQN=$2
-    #shift
-    # this assumes that functions.sh lives in the same directory as defaults.sh
-    #local THIS_SCRIPT=$( readlink -f "$0" )
-    #local SQM_LIB_DIR=$( dirname "${THIS_SCRIPT}" )
-    # extract all variables from defaults.sh using the "${VARNAME}=" as matching pattern
-    #local ALL_SQM_DEFAULTS_VARS=$( grep -r -o -e "[[:alnum:][:punct:]]*=" ${SQM_LIB_DIR}/defaults.sh | sed 's/=//' )
-    local ALL_SQM_DEFAULTS_VARS=$( grep -r -o -e "[[:alnum:][:punct:]]*=" ${defaultsFQN} | sed 's/=//' )
-    
+write_defaults_vars_to_state_file() {
+    local filename
+    local defaultsFQN
+    local ALL_SQM_DEFAULTS_VARS
+    filename=$1
+    defaultsFQN=$2
+    ALL_SQM_DEFAULTS_VARS=$( grep -r -o -e "[[:alnum:][:punct:]]*=" ${defaultsFQN} | sed 's/=//' )
+
     write_state_file ${filename} ${ALL_SQM_DEFAULTS_VARS}
-}      
-        
+}
+
 # Write a state file to the filename given as $1. The remaining arguments are
 # variable names that should be written to the state file.
 write_state_file() {
-    local filename=$1
+    local filename
+    filename=$1
     shift
     for var in "$@"; do
         val=$(eval echo '$'$var)
         echo "$var=\"$val\""
     done > $filename
-}   
+}
+
+check_state_dir() {
+    local PERM
+    local OWNER
+
+    if [ -z "${SQM_STATE_DIR}" ]; then
+        SQM_DEBUG=0 sqm_error '$SQM_STATE_DIR is unset - check your config!'
+        exit 1
+    fi
+    [ -d "${SQM_STATE_DIR}" ] || ( umask 077; mkdir -p "$SQM_STATE_DIR" ) || exit 1
+
+    if [ ! -w "${SQM_STATE_DIR}" ] || [ ! -x "${SQM_STATE_DIR}" ]; then
+        SQM_DEBUG=0 sqm_error "Cannot write to state dir '$SQM_STATE_DIR'"
+        exit 1
+    fi
+
+    # OpenWrt doesn't have stat; for now just skip the remaining tests if it's
+    # not available
+    which stat >/dev/null 2>&1 || return 0
+
+    PERM="0$(stat -L -c '%a' "${SQM_STATE_DIR}")"
+    if [ "$((PERM & 0002))" -ne 0 ]; then
+        SQM_DEBUG=0 sqm_error "State dir '$SQM_STATE_DIR' is world writable; this is unsafe, please fix"
+        exit 1
+    fi
+    OWNER="$(stat -L -c '%u' "${SQM_STATE_DIR}")"
+    if [ "$OWNER" -ne "$(id -u)" ]; then
+        SQM_DEBUG=0 sqm_error "State dir '$SQM_STATE_DIR' is owned by a different user; this is unsafe, please fix"
+        exit 1
+    fi
+}
 
 
 # find the ifb device associated with a specific interface, return nothing of no
 # ifb is associated with IF
 get_ifb_associated_with_if() {
-    local CUR_IF=$1
+    local CUR_IF
+    local CUR_IFB
+    local TMP
+    CUR_IF=$1
     # Stray ' in the comment is a fix for broken editor syntax highlighting
-    local CUR_IFB=$( $TC_BINARY -p filter show parent ffff: dev ${CUR_IF} | grep -o -E ifb'[^)\ ]+' )    # '
+    CUR_IFB=$( $TC_BINARY -p filter show parent ffff: dev ${CUR_IF} | grep -o -E ifb'[^)\ ]+' )    # '
     sqm_debug "ifb associated with interface ${CUR_IF}: ${CUR_IFB}"
 
     # we could not detect an associated IFB for CUR_IF
     if [ -z "${CUR_IFB}" ]; then
-        local TMP=$( $TC_BINARY -p filter show parent ffff: dev ${CUR_IF} )
+        TMP=$( $TC_BINARY -p filter show parent ffff: dev ${CUR_IF} )
         if [ ! -z "${TMP}" ]; then
             # oops, there is output but we failed to properly parse it? Ask for a user report
             sqm_error "#---- CUT HERE ----#"
@@ -147,51 +292,52 @@ get_ifb_associated_with_if() {
 }
 
 ifb_name() {
-    local CUR_IF=$1
-    local MAX_IF_NAME_LENGTH=15
-    local IFB_PREFIX="ifb4"
-    local NEW_IFB="${IFB_PREFIX}${CUR_IF}"
-    local IFB_NAME_LENGTH=${#NEW_IFB}
-    # IFB names can only be 15 chararcters, so we chop of excessive characters
-    # at the start of the interface name
-    if [ ${IFB_NAME_LENGTH} -gt ${MAX_IF_NAME_LENGTH} ]; then
-        local OVERLIMIT=$(( ${#NEW_IFB} - ${MAX_IF_NAME_LENGTH} ))
-        NEW_IFB=${IFB_PREFIX}${CUR_IF:${OVERLIMIT}:$(( ${MAX_IF_NAME_LENGTH} - ${#IFB_PREFIX} ))}
-    fi
+    local CUR_IF
+    local MAX_IF_NAME_LENGTH
+    local IFB_PREFIX
+    local NEW_IFB
+    CUR_IF=$1
+    MAX_IF_NAME_LENGTH=15
+    IFB_PREFIX="ifb4"
+    NEW_IFB=$( echo -n "${IFB_PREFIX}${CUR_IF}" | head -c $MAX_IF_NAME_LENGTH )
+
     echo ${NEW_IFB}
 }
 
 # if required
 create_new_ifb_for_if() {
-    local NEW_IFB=$(ifb_name $1)
+    local NEW_IFB
+    NEW_IFB=$(ifb_name $1)
     create_ifb ${NEW_IFB}
+    RET=$?
     echo $NEW_IFB
-    return $?
+    return $RET
 }
 
 
 # TODO: report failures
 create_ifb() {
-    local CUR_IFB=${1}
+    local CUR_IFB
+    CUR_IFB=${1}
     $IP link add name ${CUR_IFB} type ifb
-    ret=$?
-    return $?
 }
 
 delete_ifb() {
-    local CUR_IFB=${1}
+    local CUR_IFB
+    CUR_IFB=${1}
     $IP link set dev ${CUR_IFB} down
     $IP link delete ${CUR_IFB} type ifb
-    return $?
 }
 
 
 # the best match is either the IFB already associated with the current interface
 # or a new named IFB
 get_ifb_for_if() {
-    local CUR_IF=$1
+    local CUR_IF
+    local CUR_IFB
+    CUR_IF=$1
     # if an ifb is already associated return that
-    local CUR_IFB=$( get_ifb_associated_with_if ${CUR_IF} )
+    CUR_IFB=$( get_ifb_associated_with_if ${CUR_IF} )
     [ -z "$CUR_IFB" ] && CUR_IFB=$( create_new_ifb_for_if ${CUR_IF} )
     [ -z "$CUR_IFB" ] && sqm_warn "Could not find existing IFB for ${CUR_IF}, nor create a new IFB instead..."
     echo ${CUR_IFB}
@@ -205,25 +351,39 @@ get_ifb_for_if() {
 # note the ingress qdisc is different in that it requires tc qdisc replace dev
 # tmp_ifb ingress instead of "root ingress"
 verify_qdisc() {
-    local qdisc=$1
-    local supported="$2"
-    local ifb=TMP_IFB_4_SQM
-    local root_string="root" # this works for most qdiscs
-    local args=""
+    local qdisc
+    local supported
+    local ifb
+    local root_string
+    local args
+    local IFB_MTU
+    local found
+    qdisc=$1
+    supported="$2"
+    ifb=TMP_IFB_4_SQM
+    root_string="root" # this works for most qdiscs
+    args=""
+    IFB_MTU=1514
 
     if [ -n "$supported" ]; then
-        local found=0
+        found=0
         for q in $supported; do
             [ "$qdisc" = "$q" ] && found=1
         done
         [ "$found" -eq "1" ] || return 1
     fi
     create_ifb $ifb || return 1
+
+
     case $qdisc in
         #ingress is special
         ingress) root_string="" ;;
         #cannot instantiate tbf without args
-        tbf) args="limit 1 burst 1 rate 1kbps" ;;
+        tbf)
+    	    IFB_MTU=$( get_mtu $ifb )
+	    IFB_MTU=$(( ${IFB_MTU} + 14 )) # TBF's warning is confused, it says MTU but it checks MTU + 14
+	    args="limit 1 burst ${IFB_MTU} rate 1kbps"
+	    ;;
     esac
 
     $TC qdisc replace dev $ifb $root_string $qdisc $args
@@ -250,8 +410,10 @@ get_htb_adsll_string() {
 }
 
 get_stab_string() {
+    local STABSTRING
+    local TMP_LLAM
     STABSTRING=""
-    local TMP_LLAM=${LLAM}
+    TMP_LLAM=${LLAM}
     if [ "${LLAM}" = "default" -a "$QDISC" != "cake" ]; then
 	sqm_debug "LLA: default link layer adjustment method for !cake is tc_stab"
 	TMP_LLAM="tc_stab"
@@ -266,9 +428,10 @@ get_stab_string() {
 
 # cake knows how to handle ATM and per packet overhead, so expose and use this...
 get_cake_lla_string() {
+    local STABSTRING
+    local TMP_LLAM
     STABSTRING=""
-    local TMP_LLAM=${LLAM}
-    local CAKE_MPU_SUPPORTED=$( verify_qdisc_parameter_against_tc_help ${QDISC} mpu )
+    TMP_LLAM=${LLAM}
     if [ "${LLAM}" = "default" -a "$QDISC" = "cake" ]; then
 	sqm_debug "LLA: default link layer adjustment method for cake is cake"
 	TMP_LLAM="cake"
@@ -279,15 +442,63 @@ get_cake_lla_string() {
             STABSTRING="atm"
         fi
 
-        STABSTRING="${STABSTRING} overhead ${OVERHEAD}"
-        
-        if [ "${CAKE_MPU_SUPPORTED}" == "TRUE" ] ; then
-    	    STABSTRING="${STABSTRING} mpu ${STAB_MPU}"
-        fi
-        
+        STABSTRING="${STABSTRING} overhead ${OVERHEAD} mpu ${STAB_MPU}"
+
         sqm_debug "cake link layer adjustments: ${STABSTRING}"
     fi
     echo ${STABSTRING}
+}
+
+
+# centralize the implementation for the default sqm_start sqeuence
+# the individual sqm_start function only need to do the individually
+# necessary checking.
+# This expects the calling script to supply both an egress() and ingress() function
+# and will warn if they are missing
+sqm_start_default() {
+    #sqm_error "sqm_start_default"
+    [ -n "$IFACE" ] || return 1
+
+    # reset the iptables trace log
+    ipt_log_restart
+
+    if fn_exists sqm_prepare_script ; then
+	sqm_debug "sqm_start_default: starting sqm_prepare_script"
+        sqm_prepare_script
+    else
+	sqm_debug "sqm_start_default: no sqm_prepare_script function found, proceeding without."
+    fi
+
+    do_modules
+    verify_qdisc $QDISC || return 1
+    sqm_debug "sqm_start_default: Starting ${SCRIPT}"
+
+    [ -z "$DEV" ] && DEV=$( get_ifb_for_if ${IFACE} )
+
+    if [ "${UPLINK}" -ne 0 ];
+    then
+	CUR_DIRECTION="egress"
+	fn_exists egress && egress || sqm_warn "sqm_start_default: ${SCRIPT} lacks an egress() function"
+        #egress
+        sqm_debug "sqm_start_default: egress shaping activated"
+    else
+        sqm_debug "sqm_start_default: egress shaping deactivated"
+        SILENT=1 $TC qdisc del dev ${IFACE} root
+    fi
+    if [ "${DOWNLINK}" -ne 0 ];
+    then
+	CUR_DIRECTION="ingress"
+	verify_qdisc ingress "ingress" || return 1
+	fn_exists ingress && ingress || sqm_warn "sqm_start_default: ${SCRIPT} lacks an ingress() function"
+        #ingress
+        sqm_debug "sqm_start_default: ingress shaping activated"
+    else
+        sqm_debug "sqm_start_default: ingress shaping deactivated"
+        SILENT=1 $TC qdisc del dev ${DEV} root
+        SILENT=1 $TC qdisc del dev ${IFACE} ingress
+    fi
+
+    return 0
 }
 
 
@@ -297,18 +508,8 @@ sqm_stop() {
     [ -n "$CUR_IFB" ] && $TC qdisc del dev $CUR_IFB root #2>> ${OUTPUT_TARGET}
     [ -n "$CUR_IFB" ] && sqm_debug "${0}: ${CUR_IFB} shaper deleted"
 
-    [ -n "$CUR_IFB" ] && ipt -t mangle -D POSTROUTING -o $CUR_IFB -m mark --mark 0x00 -g QOS_MARK_${IFACE}
-    ipt -t mangle -D POSTROUTING -o $IFACE -m mark --mark 0x00/${IPT_MASK} -g QOS_MARK_${IFACE}
-    ipt -t mangle -D PREROUTING -i vtun+ -p tcp -j MARK --set-mark 0x2/${IPT_MASK}
-    # not sure whether we need to make this conditional or whether they are
-    # silent if the deletion does not work out
-    ipt -t mangle -D PREROUTING -i $IFACE -m dscp ! --dscp 0 -j DSCP --set-dscp-class be
-    ipt -t mangle -D PREROUTING -i $IFACE -m mark --mark 0x00/${IPT_MASK} -g QOS_MARK_${IFACE}
-
-    ipt -t mangle -D OUTPUT -p udp -m multiport --ports 123,53 -j DSCP --set-dscp-class AF42
-    ipt -t mangle -F QOS_MARK_${IFACE}
-    ipt -t mangle -X QOS_MARK_${IFACE}
-
+    # undo accumulated ipt commands during shutdown
+    ipt_log_rewind
 
     [ -n "$CUR_IFB" ] && $IP link set dev ${CUR_IFB} down
     [ -n "$CUR_IFB" ] && $IP link delete ${CUR_IFB} type ifb
@@ -324,124 +525,119 @@ fc() {
     prio=$(($prio + 1))
 }
 
-# Scale quantum with bandwidth to lower computation cost.
-get_htb_quantum() {
-    case "$HTB_QUANTUM_FUNCTION" in
-        linear|step)
-            eval "htb_quantum_${HTB_QUANTUM_FUNCTION} $1 $2" ;;
-        *)
-            sqm_warn "unknown HTB quantum function: '$HTB_QUANTUM_FUNCTION'."
-            echo 1500 ;; # fallback
-    esac
-}
 
-# Linear scaling within bounds
-htb_quantum_linear() {
+# allow better control over HTB's quantum variable
+# this controlls how many bytes htb ties to deque from the current tier before
+# switching to the next, if this is large mixing between pririty tiers will be
+# lumpy, but at a lower CPU cost. In first approximation quantum should not be
+# larger than burst.
+get_htb_quantum() {
+    local HTB_MTU
+    local BANDWIDTH
+    local DURATION_US
+    local MIN_QUANTUM
+    local QUANTUM
     HTB_MTU=$( get_mtu $1 )
     BANDWIDTH=$2
+    DURATION_US=$3
 
-    if [ -z "${HTB_MTU}" ] ; then
-        HTB_MTU=1500
+    sqm_debug "get_htb_quantum: 1: ${1}, 2: ${2}, 3: ${3}"
+
+    if [ -z "${DURATION_US}" ] ; then
+	DURATION_US=${SHAPER_QUANTUM_DUR_US}	# the duration of the burst in microseconds
+	sqm_warn "get_htb_quantum (by duration): Defaulting to ${DURATION_US} microseconds."
     fi
 
-    # Because $BANDWIDTH is in kbps, bytes/1ms is simply factor-8
-    # Stop at some huge quantum, and don't start until 2 MTU
-    BANDWIDTH_L=$(( ${HTB_MTU} *  2 * 8 ))
-    BANDWIDTH_H=$(( ${HTB_MTU} * 64 * 8 ))
+    if [ -n "${HTB_MTU}" -a "${DURATION_US}" -gt "0" ] ; then
+    	QUANTUM=$( get_burst ${HTB_MTU} ${BANDWIDTH} ${DURATION_US} )
+    fi
 
-    if [ ${BANDWIDTH} -gt ${BANDWIDTH_H} ] ; then
-        HTB_QUANTUM=$(( ${HTB_MTU} * 64 ))
-
-    elif [ ${BANDWIDTH} -gt ${BANDWIDTH_L} ] ; then
-        # Take no chances with order o' exec rounding
-        HTB_QUANTUM=$(( ${BANDWIDTH}   / 8 ))
-        HTB_QUANTUM=$(( ${HTB_QUANTUM} / ${HTB_MTU} ))
-        HTB_QUANTUM=$(( ${HTB_QUANTUM} * ${HTB_MTU} ))
-
+    if [ -z "$QUANTUM" ]; then
+	MIN_QUANTUM=$(( ${MTU} + 48 ))	# add 48 bytes to MTU for the  ovehead
+	MIN_QUANTUM=$(( ${MIN_QUANTUM} + 47 ))	# now do ceil(Min_BURST / 48) * 53 in shell integer arithmic
+	MIN_QUANTUM=$(( ${MIN_QUANTUM} / 48 ))
+	MIN_QUANTUM=$(( ${MIN_QUANTUM} * 53 ))	# for MTU 1489 to 1536 this will result in MIN_BURST = 1749 Bytes
+	sqm_warn "get_htb_quantum: 0 bytes quantum will not work, defaulting to one ATM/AAL5 expanded MTU packet with overhead: ${MIN_QUANTUM}"
+	echo ${MIN_QUANTUM}
     else
-        HTB_QUANTUM=${HTB_MTU}
+        echo ${QUANTUM}
     fi
-
-    sqm_debug "HTB_QUANTUM (linear): ${HTB_QUANTUM}, BANDWIDTH: ${BANDWIDTH}"
-
-    echo $HTB_QUANTUM
-}
-
-# Fixed step scaling
-htb_quantum_step() {
-    HTB_QUANTUM=$( get_mtu $1 )
-    BANDWIDTH=$2
-
-    if [ -z "${HTB_QUANTUM}" ]; then
-        HTB_QUANTUM=1500
-    fi
-    if [ ${BANDWIDTH} -gt 20000 ]; then
-        HTB_QUANTUM=$((${HTB_QUANTUM} * 2))
-    fi
-    if [ ${BANDWIDTH} -gt 30000 ]; then
-        HTB_QUANTUM=$((${HTB_QUANTUM} * 2))
-    fi
-    if [ ${BANDWIDTH} -gt 40000 ]; then
-        HTB_QUANTUM=$((${HTB_QUANTUM} * 2))
-    fi
-    if [ ${BANDWIDTH} -gt 50000 ]; then
-        HTB_QUANTUM=$((${HTB_QUANTUM} * 2))
-    fi
-    if [ ${BANDWIDTH} -gt 60000 ]; then
-        HTB_QUANTUM=$((${HTB_QUANTUM} * 2))
-    fi
-    if [ ${BANDWIDTH} -gt 80000 ]; then
-        HTB_QUANTUM=$((${HTB_QUANTUM} * 2))
-    fi
-
-    sqm_debug "HTB_QUANTUM (step): ${HTB_QUANTUM}, BANDWIDTH: ${BANDWIDTH}"
-
-    echo $HTB_QUANTUM
 }
 
 
+
+
+# try to define the burst parameter in the duration required to transmit a burst
+# at the configured bandwidth conceptuallly the matching quantum for this burst
+# should be BURST/number_of_tiers to give each htb tier a chance to dequeue into
+# each burst, but that most likely will end up with a somewhat too small quantum
+# note: to get htb to report the configured burst/cburt one needs to issue the
+# following command (for ifbpppoe-wan):
+#	tc -d class show dev ifb4pppoe-wan
 get_burst() {
+    local MTU
+    local BANDWIDTH
+    local SHAPER_BURST_US
+    local MIN_BURST
+    local BURST
     MTU=$1
-    BANDWIDTH=$2
-    BURST=
+    BANDWIDTH=$2 # note bandwidth is always given in kbps
+    SHAPER_BURST_US=$3
 
-    # 10 MTU burst can itself create delay under CPU load.
-    # It will need to all wait for a hardware commit.
-    # Note the lean mixture at high bandwidths for upper limit.
-    BANDWIDTH_L=$(( ${MTU} *  2 * 8 ))
-    BANDWIDTH_H=$(( ${MTU} * 18 * 8 ))
+    sqm_debug "get_burst: 1: ${1}, 2: ${2}, 3: ${3}"
 
-
-    if [ ${BANDWIDTH} -gt ${BANDWIDTH_H} ] ; then
-        BURST=$(( ${HTB_MTU} * 10 ))
-
-    elif [ ${BANDWIDTH} -gt ${BANDWIDTH_L} ] ; then
-            # Start with 1ms buffer 2x MTU, and lean out the mixture at higher rates
-            BURST=$(( ${BANDWIDTH} - ${BANDWIDTH_L} ))
-            BURST=$(( ${BURST} / 16 ))
-            BURST=$(( ${BURST} / ${MTU} ))
-            BURST=$(( ${BURST} * ${MTU} ))
-            BURST=$(( ${BURST} + ${MTU} * 2 ))
+    if [ -z "${SHAPER_BURST_US}" ] ; then
+	SHAPER_BURST_US=1000	# the duration of the burst in microseconds
+	sqm_warn "get_burst (by duration): Defaulting to ${SHAPER_BURST_US} microseconds bursts."
     fi
 
-    sqm_debug "BURST: ${BURST}, BANDWIDTH: ${BANDWIDTH}"
+    # let's assume ATM/AAL5 to be the worst case encapsulation
+    #	and 48 Bytes a reasonable worst case per packet overhead
+    MIN_BURST=$(( ${MTU} + 48 ))	# add 48 bytes to MTU for the  ovehead
+    MIN_BURST=$(( ${MIN_BURST} + 47 ))	# now do ceil(Min_BURST / 48) * 53 in shell integer arithmic
+    MIN_BURST=$(( ${MIN_BURST} / 48 ))
+    MIN_BURST=$(( ${MIN_BURST} * 53 ))	# for MTU 1489 to 1536 this will result in MIN_BURST = 1749 Bytes
 
-    echo $BURST
+    # htb/tbf expect burst to be specified in bytes, while bandwidth is in kbps
+    BURST=$(( ((${SHAPER_BURST_US} * ${BANDWIDTH}) / 8000) ))
+
+    if [ ${BURST} -lt ${MIN_BURST} ] ; then
+	sqm_log "get_burst (by duration): the calculated burst/quantum size of ${BURST} bytes was below the minimum of ${MIN_BURST} bytes."
+	BURST=${MIN_BURST}
+    fi
+
+    sqm_debug "get_burst (by duration): BURST [Byte]: ${BURST}, BANDWIDTH [Kbps]: ${BANDWIDTH}, DURATION [us]: ${SHAPER_BURST_US}"
+
+    echo ${BURST}
 }
+
 
 # Create optional burst parameters to leap over CPU interupts when the CPU is
 # severly loaded. We need to be conservative though.
 get_htb_burst() {
+    local HTB_MTU
+    local BANDWIDTH
+    local DURATION_US
+    local BURST
     HTB_MTU=$( get_mtu $1 )
     BANDWIDTH=$2
+    DURATION_US=$3
 
-    if [ -n "${HTB_MTU}" -a "${SHAPER_BURST}" -eq "1" ] ; then
-        BURST=$( get_burst $HTB_MTU $BANDWIDTH )
-        if [ -n "$BURST" ]; then
-            echo burst $BURST cburst $BURST
-        else
-            sqm_debug "Default Burst, HTB will use MTU plus shipping and handling"
-        fi
+    sqm_debug "get_htb_burst: 1: ${1}, 2: ${2}, 3: ${3}"
+
+    if [ -z "${DURATION_US}" ] ; then
+	DURATION_US=${SHAPER_BURST_DUR_US}	# the duration of the burst in microseconds
+	sqm_warn "get_htb_burst (by duration): Defaulting to ${SHAPER_BURST_DUR_US} microseconds."
+    fi
+
+    if [ -n "${HTB_MTU}" -a "${DURATION_US}" -gt "0" ] ; then
+    	BURST=$( get_burst ${HTB_MTU} ${BANDWIDTH} ${DURATION_US} )
+    fi
+
+    if [ -z "$BURST" ]; then
+	sqm_debug "get_htb_burst: Default Burst, HTB will use MTU plus shipping and handling"
+    else
+        echo burst $BURST cburst $BURST
     fi
 }
 
@@ -490,8 +686,10 @@ get_flows_count() {
 # Note, the link bandwidth in the current direction (ingress or egress)
 # is required to adjust the target for slow links
 get_target() {
-    local CUR_TARGET=${1}
-    local CUR_LINK_KBPS=${2}
+    local CUR_TARGET
+    local CUR_LINK_KBPS
+    CUR_TARGET=${1}
+    CUR_LINK_KBPS=${2}
     [ ! -z "$CUR_TARGET" ] && sqm_debug "cur_target: ${CUR_TARGET} cur_bandwidth: ${CUR_LINK_KBPS}"
     CUR_TARGET_STRING=
     # either e.g. 100ms or auto
@@ -700,24 +898,5 @@ eth_setup() {
        do
           echo $(( 4 * $( get_mtu ${IFACE} ) )) > $i/limit_max
        done
-    fi
-}
-
-
-# try to check whether a given qdisc parameter is supported by the installed tc.
-verify_qdisc_parameter_against_tc_help() {
-    local qdisc_2_check=$1
-    local parameter_2_check=$2
-    local tmp_tc_parameter_found
-    tmp_tc_parameter_found=$( tc qdisc add root ${qdisc_2_check} help 2>&1 | grep -o -e "${parameter_2_check}" )
-    #echo $tmp_tc_parameter_found
-    if [ -z "${tmp_tc_parameter_found}" ]; then
-	#sqm_error "${qdisc_2_check}: parameter ${parameter_2_check} not supported by tc."
-	echo "FALSE"
-	return 1
-    else
-	#sqm_debug "${1} parameter ${2} supported by tc."
-	echo "TRUE"
-	return 0
     fi
 }
