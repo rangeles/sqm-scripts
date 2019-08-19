@@ -7,7 +7,7 @@
 #
 #  Copyright (C) 2012-2016
 #    Michael D. Taht, Toke Høiland-Jørgensen, Sebastian Moeller
-#  Copyright (C) 2016
+#  Copyright (C) 2016-2019
 #    Ron Angeles
 #
 ################################################################################
@@ -20,10 +20,10 @@ egress() {
     BK_RATE=`expr $CEIL / 6`   # Min for background
     BE_CEIL=`expr $CEIL - 16`  # A little slop at the top
 
-    LQ="quantum `get_htb_quantum $IFACE $CEIL`"
-    BURST="`get_htb_burst $IFACE $CEIL`"
+    LQ="quantum `get_htb_quantum $IFACE $CEIL ${ESHAPER_QUANTUM_DUR_US}`"
+    BURST="`get_htb_burst $IFACE $CEIL ${ESHAPER_BURST_DUR_US}`"
 
-    $TC qdisc del dev $IFACE root 2> /dev/null
+    SILENT=1 $TC qdisc del dev $IFACE root
 
     $TC qdisc add dev $IFACE root handle 1: `get_stab_string` htb default 12
     $TC class add dev $IFACE parent 1: classid 1:1 htb $LQ rate ${CEIL}kbit ceil ${CEIL}kbit $BURST `get_htb_adsll_string`
@@ -79,13 +79,13 @@ ingress() {
     BK_RATE=`expr $CEIL / 6`   # Min for background
     BE_CEIL=`expr $CEIL - 16`  # A little slop at the top
 
-    LQ="quantum `get_htb_quantum $IFACE $CEIL`"
-    BURST="`get_htb_burst $IFACE $CEIL`"
+    LQ="quantum `get_htb_quantum $IFACE $CEIL ${ISHAPER_QUANTUM_DUR_US}`"
+    BURST="`get_htb_burst $IFACE $CEIL ${ISHAPER_BURST_DUR_US}`"
 
-    $TC qdisc del dev $IFACE handle ffff: ingress 2> /dev/null
+    SILENT=1 $TC qdisc del dev $IFACE handle ffff: ingress
     $TC qdisc add dev $IFACE handle ffff: ingress
 
-    $TC qdisc del dev $DEV root  2> /dev/null
+    SILENT=1 $TC qdisc del dev $DEV root
 
     $TC qdisc add dev $DEV root handle 1: `get_stab_string` htb default 12
     $TC class add dev $DEV parent 1: classid 1:1 htb $LQ rate ${CEIL}kbit ceil ${CEIL}kbit $BURST `get_htb_adsll_string`
@@ -140,41 +140,8 @@ ingress() {
 
 }
 
-sqm_start() {
-    [ -n "$IFACE" ] || return 1
+sqm_prepare_script() {
     do_modules
     verify_qdisc "htb" || return 1
-    verify_qdisc $QDISC || return 1
-    sqm_debug "Starting ${SCRIPT}"
-
-    [ -z "$DEV" ] && DEV=$( get_ifb_for_if ${IFACE} )
-
-    if [ "$UPLINK" -ne 0 ]; then
-        egress
-        sqm_debug "egress shaping activated"
-    else
-        sqm_debug "egress shaping deactivated"
-        $TC qdisc del dev $IFACE root 2> /dev/null
-    fi
-
-    if [ "$DOWNLINK" -ne 0 ]; then
-        verify_qdisc ingress "ingress" || return 1
-        ingress
-        sqm_debug "ingress shaping activated"
-    else
-        sqm_debug "ingress shaping deactivated"
-        $TC qdisc del dev $DEV root 2> /dev/null
-        $TC qdisc del dev $IFACE ingress 2> /dev/null
-    fi
-
-
-    return 0
-}
-
-sqm_stop() {
-    $TC qdisc del dev $IFACE ingress
-    $TC qdisc del dev $IFACE root
-    $TC qdisc del dev $DEV root
-
-    return 0
+    ipt_setup
 }
